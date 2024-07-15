@@ -1,0 +1,62 @@
+import psycopg2
+import pandas as pd
+num_ci = 10918082  # tu número de carnet
+
+cur.execute("SELECT country_code FROM country_info WHERE num_ci = %s;", (num_ci,))
+assigned_countries = [row[0] for row in cur.fetchall()]
+print("Países asignados:", assigned_countries)
+
+# Obtener los IDs de los indicadores necesarios
+cur.execute("""
+SELECT id, indicator_code 
+FROM indicator 
+WHERE indicator_code IN ('NY.GDP.PCAP.KD', 'SI.POV.GINI', 'SI.POV.LMIC.GP', 'SP.POP.TOTL');
+""")
+indicators = {row[1]: row[0] for row in cur.fetchall()}
+
+# Construir consulta para extraer los datos necesarios
+query = f"""
+SELECT 
+    y.year,
+    y.value,
+    i.indicator_code,
+    c.country_code,
+    ci.country_name
+FROM yearly_value y
+JOIN indicator i ON y.indicator_id = i.id
+JOIN country_info c ON y.country_info_id = c.id
+JOIN country_info ci ON c.id = ci.id  -- Join adicional para obtener country_name
+WHERE c.country_code IN ({', '.join("'" + country + "'" for country in assigned_countries)})
+AND i.id IN ({', '.join(map(str, indicators.values()))});
+"""
+
+
+df = pd.read_sql_query(query, conn)
+print("Datos extraídos:\n", df.head())
+
+# Transformar los datos en un formato adecuado
+df_pivot = df.pivot_table(index=['year', 'country_code', 'country_name'], columns='indicator_code', values='value').reset_index()
+print("Datos pivotados:\n", df_pivot.head())
+
+# Revisar los valores faltantes
+print("Valores faltantes por columna:\n", df_pivot.isna().sum())
+
+# Eliminar filas con valores faltantes en las columnas necesarias
+df_pivot.dropna(subset=['NY.GDP.PCAP.KD', 'SP.POP.TOTL', 'SI.POV.GINI', 'SI.POV.LMIC.GP'], inplace=True)
+
+# Calcular el IPS
+df_pivot['IPS'] = (df_pivot['NY.GDP.PCAP.KD'] / df_pivot['SP.POP.TOTL']) * (1 - df_pivot['SI.POV.GINI']) * (1 - df_pivot['SI.POV.LMIC.GP'])
+print("Datos con IPS calculado:\n", df_pivot[['year', 'country_code', 'IPS']])
+
+for index, row in df_pivot.iterrows():
+    cur.execute("""
+    INSERT INTO yearly_value (year, value, country_info_id, indicator_id)
+    VALUES (%s, %s, (SELECT id FROM country_info WHERE country_code = %s), 
+            (SELECT id FROM indicator WHERE indicator_code = 'SI.PROSP.IDX'))
+    ON CONFLICT (year, country_info_id, indicator_id) DO UPDATE
+    SET value = EXCLUDED.value;
+    """, (row['year'], row['IPS'], row['country_code']))
+
+conn.commit()
+cur.close()
+conn.close()
